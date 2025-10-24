@@ -1,81 +1,111 @@
-import os
-import time
-from urllib.parse import urlparse, urlunparse
-from flask import Flask, request, Response, jsonify
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+<!doctype html>
+<html lang="da">
+<head>
+  <meta charset="utf-8">
+  <title>Cinemateket – Printvenligt program</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { --brand:#005dab; --bg:#fafafa; }
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;margin:0;background:var(--bg);color:#111}
+    header{background:#fff;padding:12px 16px;box-shadow:0 2px 6px rgba(0,0,0,.06);position:sticky;top:0;z-index:10}
+    h1{margin:.2rem 0;font-size:20px}
+    .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .controls input,.controls button{padding:6px 10px;font-size:14px}
+    button{background:var(--brand);color:#fff;border:0;border-radius:6px;cursor:pointer}
+    button[disabled]{opacity:.6;cursor:not-allowed}
+    .status{margin-top:6px;font-size:13px;color:#333}
+    main{padding:16px;max-width:1000px;margin:0 auto}
+    .series{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px;margin:16px 0;box-shadow:0 2px 6px rgba(0,0,0,.04)}
+    .series h2{font-size:26px;color:#005dab;margin:6px 0}
+    .series-intro{margin:8px 0 10px 0;color:#222}
+    .series-banner{width:100%;max-height:300px;object-fit:cover;border-radius:8px}
+    .card{display:grid;grid-template-columns:120px 1fr;gap:12px;align-items:start;padding:10px 0;border-bottom:1px solid #eee;break-inside:avoid}
+    .card:last-child{border-bottom:0}
+    .poster{width:120px;height:auto;background:#f3f3f3;border-radius:6px}
+    .card h3{margin:.2rem 0 .4rem 0;font-size:18px}
+    .dates{font-weight:bold;color:#005dab}
+    @media print{header{display:none}.series{page-break-before:always;border:0;box-shadow:none}}
+  </style>
+</head>
+<body>
+<header>
+  <h1>Cinemateket – Printvenligt program</h1>
+  <div class="controls">
+    <label><input type="radio" name="scope" value="all" checked> Alle kommende</label>
+    <label><input type="radio" name="scope" value="range"> Vælg interval</label>
+    <span id="rangeInputs" style="display:none">
+      Fra <input id="from" type="date">
+      Til <input id="to" type="date">
+    </span>
+    <button id="run">Generér</button>
+  </div>
+  <div id="status" class="status">Klar.</div>
+</header>
+<main id="out"></main>
 
-# --- Konfiguration ---
-ALLOWED_HOST = "www.dfi.dk"
-ALLOWED_PATH_PREFIXES = ["/cinemateket/", "/node/41948", "/cinemateket/biograf/kalender"]
+<script>
+const $ = (id) => document.getElementById(id);
+const setStatus = (t) => $('status').textContent = t;
+function todayISO(){const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+$('from').value = todayISO();
+const tmp = new Date(); tmp.setDate(tmp.getDate()+30);
+$('to').value = `${tmp.getFullYear()}-${String(tmp.getMonth()+1).padStart(2,'0')}-${String(tmp.getDate()).padStart(2,'0')}`;
+document.querySelectorAll('input[name="scope"]').forEach(r=>{
+  r.addEventListener('change',()=>{
+    $('rangeInputs').style.display = (document.querySelector('input[name="scope"]:checked').value === 'range') ? '' : 'none';
+  });
+});
 
-CACHE_TTL = 300
-CACHE_MAX_SIZE = 256
-UPSTREAM_TIMEOUT = 20
-RATE_LIMIT_RPM = 120
+function fmtDates(arr){ return arr.map(s=>`${s.slice(8,10)}.${s.slice(5,7)} kl. ${s.slice(11,16)}`).join(', '); }
+function cardHTML(it){
+  return `<div class="card">
+    ${it.image ? `<img class="poster" src="${it.image}" alt="">` : `<div></div>`}
+    <div>
+      <h3>${it.title || 'Titel'}</h3>
+      ${it.synopsis ? `<div>${it.synopsis.replace(/\n{2,}/g,'<br><br>')}</div>` : ``}
+      ${it.dates?.length ? `<p class="dates">Datoer: ${fmtDates(it.dates)}</p>` : ``}
+      <a href="${it.url}" target="_blank" rel="noopener">Detaljer</a>
+    </div>
+  </div>`;
+}
+function render(data){
+  const out = $('out'); let html = '';
+  const series = data.series || [];
+  for (const s of series){
+    html += `<section class="series">
+      <h2>${s.name}</h2>
+      ${s.banner ? `<img class="series-banner" src="${s.banner}" alt="">` : ``}
+      ${s.intro ? `<div class="series-intro">${s.intro}</div>` : ``}
+      ${s.items.map(cardHTML).join('')}
+    </section>`;
+  }
+  out.innerHTML = html || '<p>Ingen visninger i valgt interval.</p>';
+}
 
-app = Flask(__name__, static_folder=".", static_url_path="")
-
-# --- Requests session med retry ---
-session = requests.Session()
-retry = Retry(total=3, backoff_factor=0.3, status_forcelist=(500,502,503,504))
-adapter = HTTPAdapter(max_retries=retry)
-session.mount("http://", adapter)
-session.mount("https://", adapter)
-DEFAULT_HEADERS = {"User-Agent": "CinemateketPrint/1.0", "Accept-Language": "da-DK,da;q=0.9"}
-
-_cache = {}
-_order = []
-
-def cache_get(k):
-    now = time.time()
-    rec = _cache.get(k)
-    if not rec: return None
-    exp, data, ct = rec
-    if exp < now:
-        _cache.pop(k, None)
-        return None
-    return data, ct
-
-def cache_set(k,data,ct):
-    while len(_cache) >= CACHE_MAX_SIZE: _cache.pop(_order.pop(0), None)
-    _cache[k] = (time.time()+CACHE_TTL, data, ct)
-    _order.append(k)
-
-def allowed(url):
-    try: p = urlparse(url)
-    except: return False
-    if p.scheme not in ("http","https") or p.netloc != ALLOWED_HOST: return False
-    return any(p.path.startswith(pre) for pre in ALLOWED_PATH_PREFIXES)
-
-@app.after_request
-def headers(resp):
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    return resp
-
-@app.get("/health")
-def health(): return "ok",200
-
-@app.get("/")
-def index(): return app.send_static_file("index.html")
-
-@app.get("/fetch")
-def fetch():
-    url=request.args.get("url")
-    if not url: return Response("Missing url",400)
-    if not allowed(url): return Response("Forbidden",403)
-    cached=cache_get(url)
-    if cached: data,ct=cached; return Response(data,200,content_type=ct)
-    try:
-        r=session.get(url,timeout=UPSTREAM_TIMEOUT,headers=DEFAULT_HEADERS)
-        ct=r.headers.get("content-type","text/html; charset=utf-8")
-        if r.status_code==200: cache_set(url,r.content,ct)
-        return Response(r.content,r.status_code,content_type=ct)
-    except Exception as e:
-        return Response(f"Upstream error: {e}",502)
-
-if __name__=="__main__":
-    port=int(os.environ.get("PORT",10000))
-    app.run(host="0.0.0.0",port=port)
+$('run').addEventListener('click', async () => {
+  $('run').disabled = true;
+  try{
+    const mode = document.querySelector('input[name="scope"]:checked').value;
+    const params = new URLSearchParams();
+    params.set("mode", mode);
+    if (mode === "range"){
+      const f = $('from').value, t = $('to').value;
+      if (!f || !t || f > t){ setStatus('Ugyldigt interval.'); $('run').disabled = false; return; }
+      params.set("from", f); params.set("to", t);
+    }
+    setStatus('Henter program fra serveren…');
+    const r = await fetch('/program?'+params.toString(), { cache: 'no-store' });
+    if (!r.ok){ throw new Error('Serverfejl: '+r.status); }
+    const data = await r.json();
+    render(data);
+    setStatus('Færdig. Klar til print.');
+  }catch(e){
+    console.error(e);
+    setStatus('Fejl: ' + e.message);
+  }finally{
+    $('run').disabled = false;
+  }
+});
+</script>
+</body>
+</html>
