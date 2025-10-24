@@ -1,111 +1,27 @@
-<!doctype html>
-<html lang="da">
-<head>
-  <meta charset="utf-8">
-  <title>Cinemateket – Printvenligt program</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    :root { --brand:#005dab; --bg:#fafafa; }
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;margin:0;background:var(--bg);color:#111}
-    header{background:#fff;padding:12px 16px;box-shadow:0 2px 6px rgba(0,0,0,.06);position:sticky;top:0;z-index:10}
-    h1{margin:.2rem 0;font-size:20px}
-    .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-    .controls input,.controls button{padding:6px 10px;font-size:14px}
-    button{background:var(--brand);color:#fff;border:0;border-radius:6px;cursor:pointer}
-    button[disabled]{opacity:.6;cursor:not-allowed}
-    .status{margin-top:6px;font-size:13px;color:#333}
-    main{padding:16px;max-width:1000px;margin:0 auto}
-    .series{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px;margin:16px 0;box-shadow:0 2px 6px rgba(0,0,0,.04)}
-    .series h2{font-size:26px;color:#005dab;margin:6px 0}
-    .series-intro{margin:8px 0 10px 0;color:#222}
-    .series-banner{width:100%;max-height:300px;object-fit:cover;border-radius:8px}
-    .card{display:grid;grid-template-columns:120px 1fr;gap:12px;align-items:start;padding:10px 0;border-bottom:1px solid #eee;break-inside:avoid}
-    .card:last-child{border-bottom:0}
-    .poster{width:120px;height:auto;background:#f3f3f3;border-radius:6px}
-    .card h3{margin:.2rem 0 .4rem 0;font-size:18px}
-    .dates{font-weight:bold;color:#005dab}
-    @media print{header{display:none}.series{page-break-before:always;border:0;box-shadow:none}}
-  </style>
-</head>
-<body>
-<header>
-  <h1>Cinemateket – Printvenligt program</h1>
-  <div class="controls">
-    <label><input type="radio" name="scope" value="all" checked> Alle kommende</label>
-    <label><input type="radio" name="scope" value="range"> Vælg interval</label>
-    <span id="rangeInputs" style="display:none">
-      Fra <input id="from" type="date">
-      Til <input id="to" type="date">
-    </span>
-    <button id="run">Generér</button>
-  </div>
-  <div id="status" class="status">Klar.</div>
-</header>
-<main id="out"></main>
+import os
+from flask import Flask, send_from_directory, jsonify
 
-<script>
-const $ = (id) => document.getElementById(id);
-const setStatus = (t) => $('status').textContent = t;
-function todayISO(){const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
-$('from').value = todayISO();
-const tmp = new Date(); tmp.setDate(tmp.getDate()+30);
-$('to').value = `${tmp.getFullYear()}-${String(tmp.getMonth()+1).padStart(2,'0')}-${String(tmp.getDate()).padStart(2,'0')}`;
-document.querySelectorAll('input[name="scope"]').forEach(r=>{
-  r.addEventListener('change',()=>{
-    $('rangeInputs').style.display = (document.querySelector('input[name="scope"]:checked').value === 'range') ? '' : 'none';
-  });
-});
+app = Flask(__name__, static_folder=".", static_url_path="")
 
-function fmtDates(arr){ return arr.map(s=>`${s.slice(8,10)}.${s.slice(5,7)} kl. ${s.slice(11,16)}`).join(', '); }
-function cardHTML(it){
-  return `<div class="card">
-    ${it.image ? `<img class="poster" src="${it.image}" alt="">` : `<div></div>`}
-    <div>
-      <h3>${it.title || 'Titel'}</h3>
-      ${it.synopsis ? `<div>${it.synopsis.replace(/\n{2,}/g,'<br><br>')}</div>` : ``}
-      ${it.dates?.length ? `<p class="dates">Datoer: ${fmtDates(it.dates)}</p>` : ``}
-      <a href="${it.url}" target="_blank" rel="noopener">Detaljer</a>
-    </div>
-  </div>`;
-}
-function render(data){
-  const out = $('out'); let html = '';
-  const series = data.series || [];
-  for (const s of series){
-    html += `<section class="series">
-      <h2>${s.name}</h2>
-      ${s.banner ? `<img class="series-banner" src="${s.banner}" alt="">` : ``}
-      ${s.intro ? `<div class="series-intro">${s.intro}</div>` : ``}
-      ${s.items.map(cardHTML).join('')}
-    </section>`;
-  }
-  out.innerHTML = html || '<p>Ingen visninger i valgt interval.</p>';
-}
+@app.after_request
+def add_headers(resp):
+    resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return resp
 
-$('run').addEventListener('click', async () => {
-  $('run').disabled = true;
-  try{
-    const mode = document.querySelector('input[name="scope"]:checked').value;
-    const params = new URLSearchParams();
-    params.set("mode", mode);
-    if (mode === "range"){
-      const f = $('from').value, t = $('to').value;
-      if (!f || !t || f > t){ setStatus('Ugyldigt interval.'); $('run').disabled = false; return; }
-      params.set("from", f); params.set("to", t);
-    }
-    setStatus('Henter program fra serveren…');
-    const r = await fetch('/program?'+params.toString(), { cache: 'no-store' });
-    if (!r.ok){ throw new Error('Serverfejl: '+r.status); }
-    const data = await r.json();
-    render(data);
-    setStatus('Færdig. Klar til print.');
-  }catch(e){
-    console.error(e);
-    setStatus('Fejl: ' + e.message);
-  }finally{
-    $('run').disabled = false;
-  }
-});
-</script>
-</body>
-</html>
+@app.get("/health")
+def health():
+    return "ok", 200
+
+@app.get("/")
+def index():
+    # Server index.html fra repo-roden
+    return send_from_directory(".", "index.html")
+
+# Hvis du bruger server-side scraping senere, ligger dine API-endpoints her
+# fx: @app.get("/program") ...
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
