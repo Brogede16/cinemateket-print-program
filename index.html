@@ -5,21 +5,25 @@
   <title>Cinemateket – Printvenligt program</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;margin:0;background:#fafafa;color:#111}
-    header{background:#fff;padding:12px 16px;box-shadow:0 2px 6px rgba(0,0,0,.06)}
+    :root { --brand:#005dab; --bg:#fafafa; --muted:#555; }
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;margin:0;background:var(--bg);color:#111}
+    header{background:#fff;padding:12px 16px;box-shadow:0 2px 6px rgba(0,0,0,.06);position:sticky;top:0;z-index:10}
     h1{margin:.2rem 0;font-size:20px}
     .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
     .controls input,.controls button{padding:6px 10px;font-size:14px}
-    button{background:#005dab;color:#fff;border:0;border-radius:6px;cursor:pointer}
+    button{background:var(--brand);color:#fff;border:0;border-radius:6px;cursor:pointer}
     button[disabled]{opacity:.6;cursor:not-allowed}
     .status{margin-top:6px;font-size:13px;color:#333}
     main{padding:16px;max-width:1000px;margin:0 auto}
-    .series{background:#fff;border:1px solid #eee;border-radius:10px;padding:14px;margin:16px 0;box-shadow:0 2px 6px rgba(0,0,0,.04)}
-    .series h2{font-size:24px;color:#005dab;margin:6px 0}
-    .series-intro{margin:8px 0 10px 0}
-    .card{display:grid;grid-template-columns:120px 1fr;gap:12px;align-items:start;padding:10px 0;border-bottom:1px solid #eee}
+    .series{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px;margin:16px 0;box-shadow:0 2px 6px rgba(0,0,0,.04)}
+    .series h2{font-size:26px;color:var(--brand);margin:6px 0}
+    .series-intro{margin:8px 0 10px 0;color:#222}
+    .series-banner{width:100%;max-height:300px;object-fit:cover;border-radius:8px}
+    .card{display:grid;grid-template-columns:120px 1fr;gap:12px;align-items:start;padding:10px 0;border-bottom:1px solid #eee;break-inside:avoid}
+    .card:last-child{border-bottom:0}
     .poster{width:120px;height:auto;background:#f3f3f3;border-radius:6px}
-    .dates{font-weight:bold;color:#005dab}
+    .card h3{margin:.2rem 0 .4rem 0;font-size:18px}
+    .dates{font-weight:bold;color:var(--brand)}
     @media print{header{display:none}.series{page-break-before:always;border:0;box-shadow:none}}
   </style>
 </head>
@@ -40,13 +44,17 @@
 <main id="out"></main>
 
 <script>
+/* ------- Konfiguration ------- */
 const BASE = 'https://www.dfi.dk';
-const CALENDAR_URLS = [
-  BASE + '/cinemateket/biograf/kalender',
-  BASE + '/node/41948' // fallback
-];
+/* Den første version der “virkede” brugte /node/41948. Vi holder os til den. 
+   Hvis du får 502 igen, kan du skifte nedenstående linje til kalenderstien:
+   const CALENDAR_URL = BASE + '/cinemateket/biograf/kalender';
+*/
+const CALENDAR_URL = BASE + '/node/41948';
 const SERIES_INDEX_URL = BASE + '/cinemateket/biograf/filmserier';
 const FETCH = (url) => '/fetch?url=' + encodeURIComponent(url);
+
+/* ------- UI helpers ------- */
 const $ = (id) => document.getElementById(id);
 const parseHTML = (html) => new DOMParser().parseFromString(html,'text/html');
 const abs = (href) => { try { return new URL(href, BASE).toString(); } catch { return href; } };
@@ -54,107 +62,223 @@ const setStatus = (t) => $('status').textContent = t;
 
 function todayISO(){const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
 $('from').value = todayISO();
-const tmp=new Date();tmp.setDate(tmp.getDate()+30);
+const tmp = new Date(); tmp.setDate(tmp.getDate()+30);
 $('to').value = `${tmp.getFullYear()}-${String(tmp.getMonth()+1).padStart(2,'0')}-${String(tmp.getDate()).padStart(2,'0')}`;
-document.querySelectorAll('input[name="scope"]').forEach(r=>r.addEventListener('change',()=>{$('rangeInputs').style.display=document.querySelector('input[name="scope"]:checked').value==='range'?'':'none'}));
+
+document.querySelectorAll('input[name="scope"]').forEach(r=>{
+  r.addEventListener('change',()=>{
+    $('rangeInputs').style.display = (document.querySelector('input[name="scope"]:checked').value === 'range') ? '' : 'none';
+  });
+});
 
 function withinScope(iso,scope,start,end){if(scope==='all')return iso>=todayISO();return iso>=start&&iso<=end;}
-function isoFromLabel(label,year){const m=label.toLowerCase().match(/(\d{1,2})\.\s*(\w+)/i);if(!m)return null;const months={januar:1,februar:2,marts:3,april:4,maj:5,juni:6,juli:7,august:8,september:9,oktober:10,november:11,december:12};const mon=months[m[2]];if(!mon)return null;const d=new Date(Date.UTC(year,mon-1,parseInt(m[1],10)));return d.toISOString().slice(0,10);}
 
-async function fetchDoc(url){const r=await fetch(FETCH(url));if(!r.ok)throw new Error(`Netværksfejl ${r.status} for ${url}`);return parseHTML(await r.text());}
-
-async function tryCalendarDoc(){
-  for(const url of CALENDAR_URLS){
-    try{
-      const doc=await fetchDoc(url);
-      if(doc.querySelector('h1,h2'))return doc;
-    }catch(e){console.warn('Fejl ved kalender-url',url,e);}
-  }
-  throw new Error('Kunne ikke hente kalender fra DFI.dk');
+/* ------- Fetch wrappers ------- */
+async function fetchDoc(url){
+  const r = await fetch(FETCH(url), { cache: 'no-store' });
+  if (!r.ok) throw new Error(`Netværksfejl ${r.status} for ${url}`);
+  return parseHTML(await r.text());
 }
 
+/* ------- Kalenderparser ------- */
 async function parseCalendarDays(){
-  const doc=await tryCalendarDoc();
-  const walker=doc.createTreeWalker(doc.body,NodeFilter.SHOW_TEXT);const nodes=[];let n;
-  while(n=walker.nextNode()){const t=n.textContent.trim();if(t)nodes.push(n);}
-  const dayRe=/^(Mandag|Tirsdag|Onsdag|Torsdag|Fredag|Lørdag|Søndag)\s+\d{1,2}\./i;const timeRe=/^\d{1,2}:\d{2}$/;
-  const dayIdx=nodes.map((x,i)=>dayRe.test(x.textContent.trim())?i:-1).filter(i=>i>=0);
+  const doc = await fetchDoc(CALENDAR_URL);
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+  const nodes=[]; let n;
+  while(n = walker.nextNode()){ const t = n.textContent.trim(); if (t) nodes.push(n); }
+  const dayRe=/^(Mandag|Tirsdag|Onsdag|Torsdag|Fredag|Lørdag|Søndag)\s+\d{1,2}\./i;
+  const timeRe=/^\d{1,2}:\d{2}$/;
+  const dayIdx = nodes.map((x,i) => dayRe.test(x.textContent.trim()) ? i : -1).filter(i=>i>=0);
+
   const days=[];
-  for(let i=0;i<dayIdx.length;i++){const start=dayIdx[i],end=dayIdx[i+1]??nodes.length;
-    const label=nodes[start].textContent.trim();const chunk=nodes.slice(start,end);const entries=[];
-    for(let j=0;j<chunk.length;j++){const st=chunk[j].textContent.trim();if(timeRe.test(st)){
-      const time=st;let k=j+1,title=null;while(k<chunk.length&&!title){const c=chunk[k].textContent.trim();if(c)title=c;k++;}
-      const link=Array.from(doc.querySelectorAll('a')).find(a=>a.textContent.trim()===title);const href=link?abs(link.getAttribute('href')):null;
-      entries.push({time,title,href});
-    }}days.push({label,entries});}
+  for (let i=0;i<dayIdx.length;i++){
+    const start = dayIdx[i], end = dayIdx[i+1] ?? nodes.length;
+    const label = nodes[start].textContent.trim();
+    const chunk = nodes.slice(start, end);
+    const entries=[];
+    for (let j=0;j<chunk.length;j++){
+      const st = chunk[j].textContent.trim();
+      if (timeRe.test(st)){
+        const time = st;
+        // find titel-tekst og link
+        let k=j+1, title=null; while(k<chunk.length && !title){ const c = chunk[k].textContent.trim(); if (c) title=c; k++; }
+        const link = Array.from(doc.querySelectorAll('a')).find(a => a.textContent.trim() === title);
+        const href = link ? abs(link.getAttribute('href')) : null;
+        entries.push({ time, title:title||'', href });
+      }
+    }
+    days.push({ label, entries });
+  }
   return days;
 }
 
-async function fetchSeriesDoc(name){
-  const idx=await fetchDoc(SERIES_INDEX_URL);
-  const a=Array.from(idx.querySelectorAll('a')).find(x=>x.textContent.trim().toLowerCase()===name.trim().toLowerCase());
-  if(!a)return null;const doc=await fetchDoc(a.href);
-  const intro=doc.querySelector('.field--name-field-body p')?.textContent.trim()||'';
-  const img=doc.querySelector('img');const banner=img?abs(img.src):null;
-  return {intro,banner};
+function isoFromLabel(label, year){
+  // forventet som "Torsdag 24. oktober"
+  const m = label.toLowerCase().match(/(mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(\d{1,2})\.\s*(\w+)/i);
+  if (!m) return null;
+  const months = { januar:1,februar:2,marts:3,april:4,maj:5,juni:6,juli:7,august:8,september:9,oktober:10,november:11,december:12 };
+  const mon = months[m[3]]; if(!mon) return null;
+  const d = new Date(Date.UTC(year, mon-1, parseInt(m[2],10)));
+  return d.toISOString().slice(0,10);
 }
 
+/* ------- Serie-detektion i item-sider ------- */
+function extractSeriesNamesFromDoc(doc){
+  const out = new Set();
+  // links til seriesider
+  doc.querySelectorAll('a[href*="/cinemateket/biograf/filmserier/serie/"]').forEach(a=>{
+    const t=a.textContent.trim(); if(t) out.add(t);
+  });
+  // "Serier: X, Y"
+  const bt = doc.body?.innerText || "";
+  const m = bt.match(/Serier:\s*([^\n]+)/i);
+  if (m && m[1]) m[1].split(/[,\u2013;-]/).map(s=>s.trim()).filter(Boolean).forEach(s=>out.add(s));
+  // Drupal-felter
+  doc.querySelectorAll('.field--name-field-series a, .field--name-field-serier a').forEach(a=>{
+    const t=a.textContent.trim(); if(t) out.add(t);
+  });
+  return Array.from(out);
+}
+
+/* ------- Parse film og events ------- */
 async function parseItemPage(url){
-  const doc=await fetchDoc(url);
-  const title=doc.querySelector('h1,h2')?.textContent.trim()||'';
-  const p=Array.from(doc.querySelectorAll('p')).map(p=>p.textContent.trim()).filter(Boolean);
-  const synopsis=p.slice(0,3).join('\n\n');
-  const img=doc.querySelector('img');const image=img?abs(img.src):null;
-  const series=Array.from(doc.querySelectorAll('a[href*="/cinemateket/biograf/filmserier/serie/"]')).map(a=>a.textContent.trim());
-  return {title,synopsis,image,series};
+  const doc = await fetchDoc(url);
+  // Titel altid fra h1/h2, så "Cinemateket" ikke bliver titel
+  const title = doc.querySelector('h1,h2')?.textContent.trim() || doc.title?.trim() || '';
+  // Synopsis, tag første 1–3 afsnit
+  const ps = Array.from(doc.querySelectorAll('p')).map(p=>p.textContent.trim()).filter(Boolean);
+  const synopsis = ps.slice(0,3).join('\n\n');
+  const img = doc.querySelector('img'); const image = img ? abs(img.getAttribute('src')) : null;
+  const series = extractSeriesNamesFromDoc(doc);
+  return { title, synopsis, image, series };
 }
 
-function fmtDates(arr){return arr.map(s=>`${s.slice(8,10)}.${s.slice(5,7)} kl. ${s.slice(11,16)}`).join(', ');}
+/* ------- Serie-intro og banner ------- */
+const seriesMetaCache = new Map();
+async function fetchSeriesMeta(series_name){
+  if (seriesMetaCache.has(series_name)) return seriesMetaCache.get(series_name);
+  const idx = await fetchDoc(SERIES_INDEX_URL);
+  const a = Array.from(idx.querySelectorAll('a')).find(x => x.textContent.trim().toLowerCase() === series_name.trim().toLowerCase());
+  if (!a){ seriesMetaCache.set(series_name, null); return null; }
+  const doc = await fetchDoc(abs(a.getAttribute('href')));
+  const intro = doc.querySelector('.field--name-field-body p')?.textContent.trim() || '';
+  const img = doc.querySelector('img'); const banner = img ? abs(img.getAttribute('src')) : null;
+  const meta = { intro, banner };
+  seriesMetaCache.set(series_name, meta);
+  return meta;
+}
 
-function render(seriesMap){
-  const out=$('out');let html='';
-  for(const [sname,sdata] of seriesMap){
-    html+=`<section class="series"><h2>${sname}</h2>`;
-    if(sdata.banner)html+=`<img src="${sdata.banner}" style="max-width:100%;border-radius:8px">`;
-    if(sdata.intro)html+=`<div class="series-intro">${sdata.intro}</div>`;
-    for(const f of sdata.items){
-      html+=`<div class="card">${f.image?`<img class="poster" src="${f.image}">`:`<div></div>`}
-      <div><h3>${f.title}</h3>${f.synopsis?`<p>${f.synopsis}</p>`:''}
-      <p class="dates">Datoer: ${fmtDates(f.dates)}</p>
-      <a href="${f.url}" target="_blank">Detaljer</a></div></div>`;
-    }
-    html+='</section>';
+/* ------- Rendering ------- */
+function fmtDates(arr){ return arr.map(s=>`${s.slice(8,10)}.${s.slice(5,7)} kl. ${s.slice(11,16)}`).join(', '); }
+function cardHTML(it){
+  return `<div class="card">
+    ${it.image ? `<img class="poster" src="${it.image}" alt="">` : `<div></div>`}
+    <div>
+      <h3>${it.title}</h3>
+      ${it.synopsis ? `<div>${it.synopsis.replace(/\n{2,}/g,'<br><br>')}</div>` : ``}
+      ${it.dates?.length ? `<p class="dates">Datoer: ${fmtDates(it.dates)}</p>` : ``}
+      <a href="${it.url}" target="_blank" rel="noopener">Detaljer</a>
+    </div>
+  </div>`;
+}
+function render(seriesMap, order){
+  const out = $('out'); let html = '';
+  for (const name of order){
+    const s = seriesMap.get(name);
+    html += `<section class="series">
+      <h2>${name}</h2>
+      ${s.banner ? `<img class="series-banner" src="${s.banner}" alt="">` : ``}
+      ${s.intro ? `<div class="series-intro">${s.intro}</div>` : ``}
+      ${s.items.map(cardHTML).join('')}
+    </section>`;
   }
-  out.innerHTML=html;
+  out.innerHTML = html;
 }
 
-$('run').addEventListener('click',async()=>{
-  $('run').disabled=true;setStatus('Henter kalender...');
+/* ------- Hovedkørsel ------- */
+$('run').addEventListener('click', async () => {
+  $('run').disabled = true;
   try{
-    const scope=document.querySelector('input[name="scope"]:checked').value;
-    const from=$('from').value,to=$('to').value;
-    const Y=new Date().getFullYear();
-    const days=await parseCalendarDays();
-    const seriesMap=new Map();
+    setStatus('Henter kalender...');
+    const scope = document.querySelector('input[name="scope"]:checked').value;
+    const startISO = $('from').value, endISO = $('to').value;
+    if (scope === 'range' && (!startISO || !endISO || startISO > endISO)){
+      setStatus('Ugyldigt interval. Fra skal være før eller lig Til.'); return;
+    }
 
-    for(const d of days){
-      const iso=isoFromLabel(d.label,Y);if(!iso)continue;
-      for(const e of d.entries){
-        if(!e.href)continue;
-        const det=await parseItemPage(e.href);
-        const sname=det.series[0]||'Uden for serie';
-        if(!seriesMap.has(sname))seriesMap.set(sname,{intro:'',banner:null,items:[]});
-        const s=seriesMap.get(sname);
-        let film=s.items.find(f=>f.url===e.href);
-        if(!film){film={url:e.href,title:det.title,image:det.image,synopsis:det.synopsis,dates:[]};s.items.push(film);}
-        film.dates.push(`${iso} ${e.time}`);
+    const Y = new Date().getFullYear();
+    const days = await parseCalendarDays();
+
+    // serie -> { intro, banner, items:[{url,title,image,synopsis,dates[]}] }
+    const seriesMap = new Map();
+    const addItem = (seriesName, it) => {
+      if (!seriesMap.has(seriesName)) seriesMap.set(seriesName, { intro:'', banner:null, items:[] });
+      const s = seriesMap.get(seriesName);
+      // Én forekomst pr. URL pr. serie
+      let card = s.items.find(x => x.url === it.url);
+      if (!card){
+        card = { url: it.url, title: it.title, image: it.image, synopsis: it.synopsis, dates: [] };
+        s.items.push(card);
+      }
+      if (!card.dates.includes(it.dt)) card.dates.push(it.dt);
+    };
+
+    for (const d of days){
+      const iso = isoFromLabel(d.label, Y);
+      if (!iso) continue;
+      if (scope === 'range' && !(iso >= startISO && iso <= endISO)) continue;
+      if (scope === 'all' && !(iso >= todayISO())) continue;
+
+      for (const e of d.entries){
+        if (!e.href) continue;
+        setStatus(`Henter: ${e.title || 'titel'} …`);
+        try{
+          const det = await parseItemPage(e.href);
+          const seriesNames = det.series.length ? det.series : ['Uden for serie'];
+          for (const sname of seriesNames){
+            addItem(sname, { url:e.href, title:det.title||e.title, image:det.image||null, synopsis:det.synopsis||'', dt:`${iso} ${e.time}` });
+          }
+        }catch(err){
+          console.warn('Kunne ikke hente item', e.href, err);
+        }
       }
     }
 
-    for(const [k,v] of seriesMap){if(k!=='Uden for serie'){try{const meta=await fetchSeriesDoc(k);if(meta){v.intro=meta.intro;v.banner=meta.banner;}}catch{}}}
-    render(seriesMap);
+    // Hent serie-meta, filtrér tomme, sortér
+    const names = Array.from(seriesMap.keys());
+    for (const name of names){
+      // sortér datoer pr. kort
+      const s = seriesMap.get(name);
+      s.items.forEach(x => x.dates.sort((a,b)=>a.localeCompare(b)));
+      // fjern kort uden datoer, så serien kan blive tom
+      s.items = s.items.filter(x => x.dates.length);
+      // hent intro/banner når serien ikke er "Uden for serie"
+      if (name !== 'Uden for serie' && s.items.length){
+        try{
+          const meta = await fetchSeriesMeta(name);
+          if (meta){ s.intro = meta.intro || ''; s.banner = meta.banner || null; }
+        }catch{}
+      }
+      // drop serier uden items
+      if (!s.items.length) seriesMap.delete(name);
+    }
+
+    // sortér serier efter tidligst kommende visning, derefter alfabetisk
+    const order = Array.from(seriesMap.keys()).sort((a,b)=>{
+      const fa = seriesMap.get(a).items.reduce((min, x)=>Math.min(min, Date.parse(x.dates[0].replace(' ','T'))), Number.POSITIVE_INFINITY);
+      const fb = seriesMap.get(b).items.reduce((min, x)=>Math.min(min, Date.parse(x.dates[0].replace(' ','T'))), Number.POSITIVE_INFINITY);
+      if (fa !== fb) return fa - fb;
+      return a.localeCompare(b);
+    });
+
+    render(seriesMap, order);
     setStatus('Færdig. Klar til print (Cmd+P).');
-  }catch(e){console.error(e);setStatus('Fejl: '+e.message);}finally{$('run').disabled=false;}
+  }catch(e){
+    console.error(e);
+    setStatus('Fejl: ' + e.message);
+  }finally{
+    $('run').disabled = false;
+  }
 });
 </script>
 </body>
