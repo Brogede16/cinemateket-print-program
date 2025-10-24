@@ -2,10 +2,10 @@
 <html lang="da">
 <head>
   <meta charset="utf-8">
-  <title>Cinemateket – Printvenligt program</title>
+  <title>Cinemateket - Printvenligt program</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    :root { --brand:#005dab; --bg:#fafafa; --muted:#555; }
+    :root { --brand:#005dab; --bg:#fafafa; }
     body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;margin:0;background:var(--bg);color:#111}
     header{background:#fff;padding:12px 16px;box-shadow:0 2px 6px rgba(0,0,0,.06);position:sticky;top:0;z-index:10}
     h1{margin:.2rem 0;font-size:20px}
@@ -29,7 +29,7 @@
 </head>
 <body>
 <header>
-  <h1>Cinemateket – Printvenligt program</h1>
+  <h1>Cinemateket - Printvenligt program</h1>
   <div class="controls">
     <label><input type="radio" name="scope" value="all" checked> Alle kommende</label>
     <label><input type="radio" name="scope" value="range"> Vælg interval</label>
@@ -37,351 +37,75 @@
       Fra <input id="from" type="date">
       Til <input id="to" type="date">
     </span>
-    <button id="run">Generér</button>
+    <button id="run">Generer</button>
   </div>
   <div id="status" class="status">Klar.</div>
 </header>
 <main id="out"></main>
 
 <script>
-/* ------- Konfiguration ------- */
-const BASE = 'https://www.dfi.dk';
-const CALENDAR_URL = BASE + '/node/41948'; // behold den, da det virkede hos dig
-const SERIES_INDEX_URL = BASE + '/cinemateket/biograf/filmserier';
-const FETCH = (url) => '/fetch?url=' + encodeURIComponent(url);
-
-/* ------- Hjælpere ------- */
 const $ = (id) => document.getElementById(id);
-const parseHTML = (html) => new DOMParser().parseFromString(html,'text/html');
-const abs = (href) => { try { return new URL(href, BASE).toString(); } catch { return href; } };
 const setStatus = (t) => $('status').textContent = t;
 
-function todayISO(){const d=new Date();return`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+function todayISO(){
+  const d=new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
 $('from').value = todayISO();
 const tmp = new Date(); tmp.setDate(tmp.getDate()+30);
 $('to').value = `${tmp.getFullYear()}-${String(tmp.getMonth()+1).padStart(2,'0')}-${String(tmp.getDate()).padStart(2,'0')}`;
+
 document.querySelectorAll('input[name="scope"]').forEach(r=>{
   r.addEventListener('change',()=>{
     $('rangeInputs').style.display = (document.querySelector('input[name="scope"]:checked').value === 'range') ? '' : 'none';
   });
 });
-function withinScope(iso,scope,start,end){if(scope==='all')return iso>=todayISO();return iso>=start&&iso<=end;}
 
-/* ------- Fetch med enkel retry ------- */
-async function fetchDoc(url, tries=2){
-  let lastErr;
-  for(let i=0;i<tries;i++){
-    try{
-      const r = await fetch(FETCH(url), { cache:'no-store' });
-      if (!r.ok) throw new Error(`Netværksfejl ${r.status} for ${url}`);
-      return parseHTML(await r.text());
-    }catch(e){ lastErr=e; }
-  }
-  throw lastErr || new Error('Ukendt netværksfejl');
+function fmtDates(arr){
+  return arr.map(s=>`${s.slice(8,10)}.${s.slice(5,7)} kl. ${s.slice(11,16)}`).join(', ');
 }
-
-/* ------- Kalenderparser ------- */
-async function parseCalendarDays(){
-  const doc = await fetchDoc(CALENDAR_URL);
-  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
-  const nodes=[]; let n;
-  while(n = walker.nextNode()){ const t = n.textContent.trim(); if (t) nodes.push(n); }
-  const dayRe=/^(Mandag|Tirsdag|Onsdag|Torsdag|Fredag|Lørdag|Søndag)\s+\d{1,2}\./i;
-  const timeRe=/^\d{1,2}:\d{2}$/;
-  const dayIdx = nodes.map((x,i) => dayRe.test(x.textContent.trim()) ? i : -1).filter(i=>i>=0);
-
-  const days=[];
-  for (let i=0;i<dayIdx.length;i++){
-    const start = dayIdx[i], end = dayIdx[i+1] ?? nodes.length;
-    const label = nodes[start].textContent.trim();
-    const chunk = nodes.slice(start, end);
-    const entries=[];
-    for (let j=0;j<chunk.length;j++){
-      const st = chunk[j].textContent.trim();
-      if (timeRe.test(st)){
-        const time = st;
-        // find titel-tekst og link
-        let k=j+1, title=null; while(k<chunk.length && !title){ const c = chunk[k].textContent.trim(); if (c) title=c; k++; }
-        // 1) match link på præcis tekst
-        let link = Array.from(doc.querySelectorAll('a')).find(a => a.textContent.trim() === title);
-        // 2) fallback: første relevante link med film- eller event-URL i hele dokumentet
-        if(!link){
-          link = Array.from(doc.querySelectorAll('a[href*="/cinemateket/biograf/alle-film/film/"],a[href*="/cinemateket/biograf/events/event/"]'))[0] || null;
-        }
-        const href = link ? abs(link.getAttribute('href')) : null;
-        entries.push({ time, title:title||'', href });
-      }
-    }
-    days.push({ label, entries });
-  }
-  return days;
-}
-
-function isoFromLabel(label, year){
-  const m = label.toLowerCase().match(/(mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(\d{1,2})\.\s*(\w+)/i);
-  if (!m) return null;
-  const months = { januar:1,februar:2,marts:3,april:4,maj:5,juni:6,juli:7,august:8,september:9,oktober:10,november:11,december:12 };
-  const mon = months[m[3]]; if(!mon) return null;
-  const d = new Date(Date.UTC(year, mon-1, parseInt(m[2],10)));
-  return d.toISOString().slice(0,10);
-}
-
-/* ------- Tekst-rensning ------- */
-function cleanSynopsisText(txt){
-  if (!txt) return '';
-  const blacklist = [
-    'Gør dit lærred lidt bredere',
-    'Filmtaget',
-    'Se alle',
-    'Læs mere',
-    'Køb billetter',
-    'Relaterede programmer'
-  ];
-  let t = txt.replace(/\s+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
-  for (const bad of blacklist){
-    const re = new RegExp(bad,'gi'); t = t.replace(re,'');
-  }
-  // trim ved meta-afsnit
-  t = t.split(/\n+/).filter(p => !/^(Medvirkende|Instruktør|Original titel|Sprog|Aldersgrænse|Længde):/i.test(p)).join('\n\n');
-  // maks ~160 ord
-  const words = t.split(/\s+/);
-  if (words.length > 160) t = words.slice(0,160).join(' ') + '…';
-  return t.trim();
-}
-
-/* ------- Serie-detektion ------- */
-function extractSeriesNamesFromDoc(doc){
-  const out = new Set();
-
-  // 1) Direkte links til serier
-  doc.querySelectorAll('a[href*="/cinemateket/biograf/filmserier/serie/"]').forEach(a=>{
-    const t=a.textContent.trim(); if(t) out.add(t);
-  });
-
-  // 2) Tekstmønster "Serier: X, Y"
-  const bt = doc.body?.innerText || "";
-  const m = bt.match(/Serier:\s*([^\n]+)/i);
-  if (m && m[1]) m[1].split(/[,\u2013;-]/).map(s=>s.trim()).filter(Boolean).forEach(s=>out.add(s));
-
-  // 3) Drupal felter
-  doc.querySelectorAll('.field--name-field-series a, .field--name-field-serier a').forEach(a=>{
-    const t=a.textContent.trim(); if(t) out.add(t);
-  });
-
-  // 4) Breadcrumb fallback
-  const bc = Array.from(doc.querySelectorAll('nav.breadcrumb a, .breadcrumb a'));
-  const idx = bc.findIndex(a => a.getAttribute('href')?.includes('/cinemateket/biograf/filmserier'));
-  if (idx >= 0 && bc[idx+1]) {
-    const t = bc[idx+1].textContent.trim();
-    if (t) out.add(t);
-  }
-
-  return Array.from(out).map(s => s.replace(/\s+/g,' ').trim());
-}
-
-/* ------- Titel-ekstraktion ------- */
-function titleFromSlug(url){
-  try{
-    const u = new URL(url);
-    const seg = u.pathname.split('/').filter(Boolean).pop() || '';
-    const words = seg.replace(/[-_]+/g,' ').replace(/\d{1,2}-\d{1,2}(-\d{2,4})?/g,'').trim().split(/\s+/);
-    return words.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-  }catch{return '';}
-}
-function extractTitle(doc, url){
-  const og = doc.querySelector('meta[property="og:title"]')?.getAttribute('content')?.trim();
-  if (og && og.toLowerCase() !== 'cinemateket') return og;
-
-  const tw = doc.querySelector('meta[name="twitter:title"]')?.getAttribute('content')?.trim();
-  if (tw && tw.toLowerCase() !== 'cinemateket') return tw;
-
-  const lds = Array.from(doc.querySelectorAll('script[type="application/ld+json"]')).map(s=>s.textContent);
-  for (const ld of lds){
-    try{
-      const obj = JSON.parse(ld);
-      if (Array.isArray(obj)){
-        for (const it of obj){
-          if (it && it.name && String(it.name).trim().toLowerCase() !== 'cinemateket'){
-            return String(it.name).trim();
-          }
-        }
-      } else if (obj && obj.name && String(obj.name).trim().toLowerCase() !== 'cinemateket'){
-        return String(obj.name).trim();
-      }
-    }catch{}
-  }
-
-  const h = doc.querySelector('h1,h2')?.textContent?.trim();
-  if (h && h.toLowerCase() !== 'cinemateket') return h;
-
-  const t = doc.title?.trim();
-  if (t && t.toLowerCase() !== 'cinemateket') return t;
-
-  // Slug-fallback
-  const slug = titleFromSlug(url);
-  if (slug && slug.toLowerCase() !== 'cinemateket') return slug;
-
-  return '';
-}
-
-/* ------- Parse film/event-side robust ------- */
-async function parseItemPage(url){
-  const doc = await fetchDoc(url);
-  const title = extractTitle(doc, url);
-  // synopsis: hovedfelt hvis muligt
-  let raw = '';
-  const field = doc.querySelector('.field--name-field-body, .field--name-body, article, main');
-  if (field){
-    const ps = Array.from(field.querySelectorAll('p')).map(p=>p.textContent.trim()).filter(Boolean);
-    raw = ps.slice(0,4).join('\n\n');
-  }
-  if (!raw){
-    const ps = Array.from(doc.querySelectorAll('p')).map(p=>p.textContent.trim()).filter(Boolean);
-    raw = ps.slice(0,4).join('\n\n');
-  }
-  const synopsis = cleanSynopsisText(raw);
-
-  let img = field?.querySelector('img') || doc.querySelector('article img, main img, img');
-  const image = img ? abs(img.getAttribute('src')) : null;
-
-  const series = extractSeriesNamesFromDoc(doc);
-  return { title, synopsis, image, series };
-}
-
-/* ------- Serie-intro og banner ------- */
-const seriesMetaCache = new Map();
-async function fetchSeriesMeta(series_name){
-  if (seriesMetaCache.has(series_name)) return seriesMetaCache.get(series_name);
-  const idx = await fetchDoc(SERIES_INDEX_URL);
-  const a = Array.from(idx.querySelectorAll('a')).find(x => x.textContent.trim().toLowerCase() === series_name.trim().toLowerCase());
-  if (!a){ seriesMetaCache.set(series_name, null); return null; }
-  const doc = await fetchDoc(abs(a.getAttribute('href')));
-  const wrap = doc.querySelector('.field--name-field-body, .field--name-body, article, main');
-  const ps = wrap ? Array.from(wrap.querySelectorAll('p')).map(p=>p.textContent.trim()).filter(Boolean) : [];
-  const intro = cleanSynopsisText(ps.slice(0,4).join('\n\n'));
-  const img = wrap?.querySelector('img') || doc.querySelector('article img, main img, img');
-  const banner = img ? abs(img.getAttribute('src')) : null;
-  const meta = { intro, banner };
-  seriesMetaCache.set(series_name, meta);
-  return meta;
-}
-
-/* ------- Rendering ------- */
-function fmtDates(arr){ return arr.map(s=>`${s.slice(8,10)}.${s.slice(5,7)} kl. ${s.slice(11,16)}`).join(', '); }
 function cardHTML(it){
   return `<div class="card">
     ${it.image ? `<img class="poster" src="${it.image}" alt="">` : `<div></div>`}
     <div>
-      <h3>${it.title || 'Titel mangler'}</h3>
+      <h3>${it.title || 'Titel'}</h3>
       ${it.synopsis ? `<div>${it.synopsis.replace(/\n{2,}/g,'<br><br>')}</div>` : ``}
       ${it.dates?.length ? `<p class="dates">Datoer: ${fmtDates(it.dates)}</p>` : ``}
       <a href="${it.url}" target="_blank" rel="noopener">Detaljer</a>
     </div>
   </div>`;
 }
-function render(seriesMap, order){
+function render(data){
   const out = $('out'); let html = '';
-  for (const name of order){
-    const s = seriesMap.get(name);
+  const series = data.series || [];
+  for (const s of series){
     html += `<section class="series">
-      <h2>${name}</h2>
+      <h2>${s.name}</h2>
       ${s.banner ? `<img class="series-banner" src="${s.banner}" alt="">` : ``}
       ${s.intro ? `<div class="series-intro">${s.intro}</div>` : ``}
       ${s.items.map(cardHTML).join('')}
     </section>`;
   }
-  out.innerHTML = html;
+  out.innerHTML = html || '<p>Ingen visninger i valgt interval.</p>';
 }
 
-/* ------- Hovedkørsel ------- */
 $('run').addEventListener('click', async () => {
   $('run').disabled = true;
   try{
-    setStatus('Henter kalender...');
-    const scope = document.querySelector('input[name="scope"]:checked').value;
-    const startISO = $('from').value, endISO = $('to').value;
-    if (scope === 'range' && (!startISO || !endISO || startISO > endISO)){
-      setStatus('Ugyldigt interval. Fra skal være før eller lig Til.'); return;
+    const mode = document.querySelector('input[name="scope"]:checked').value;
+    const params = new URLSearchParams();
+    params.set("mode", mode);
+    if (mode === "range"){
+      const f = $('from').value, t = $('to').value;
+      if (!f || !t || f > t){ setStatus('Ugyldigt interval.'); $('run').disabled = false; return; }
+      params.set("from", f); params.set("to", t);
     }
-
-    const Y = new Date().getFullYear();
-    const days = await parseCalendarDays();
-
-    // serie -> { intro, banner, items:[{url,title,image,synopsis,dates[]}] }
-    const seriesMap = new Map();
-    const addItem = (seriesName, it) => {
-      const key = seriesName && seriesName.trim() ? seriesName.trim() : 'Uden for serie';
-      if (!seriesMap.has(key)) seriesMap.set(key, { intro:'', banner:null, items:[] });
-      const s = seriesMap.get(key);
-      // én forekomst per URL per serie
-      let card = s.items.find(x => x.url === it.url);
-      if (!card){
-        card = { url: it.url, title: it.title, image: it.image, synopsis: it.synopsis, dates: [] };
-        s.items.push(card);
-      }
-      if (!card.dates.includes(it.dt)) card.dates.push(it.dt);
-    };
-
-    for (const d of days){
-      const iso = isoFromLabel(d.label, Y);
-      if (!iso) continue;
-      if (scope === 'range' && !(iso >= startISO && iso <= endISO)) continue;
-      if (scope === 'all' && !(iso >= todayISO())) continue;
-
-      for (const e of d.entries){
-        if (!e.href) continue;
-        setStatus(`Henter: ${e.title || 'titel'} …`);
-        try{
-          const det = await parseItemPage(e.href);
-          const finalTitle = det.title && det.title.toLowerCase() !== 'cinemateket' ? det.title : (e.title || titleFromSlug(e.href));
-          const seriesNames = (det.series && det.series.length) ? det.series : ['Uden for serie'];
-          for (const sname of seriesNames){
-            addItem(sname, {
-              url: e.href,
-              title: finalTitle,
-              image: det.image || null,
-              synopsis: det.synopsis || '',
-              dt: `${iso} ${e.time}`
-            });
-          }
-        }catch(err){
-          // Fallback når item-side svigter: brug kalenderens titel eller slug
-          const finalTitle = e.title || titleFromSlug(e.href);
-          addItem('Uden for serie', {
-            url: e.href,
-            title: finalTitle,
-            image: null,
-            synopsis: '',
-            dt: `${iso} ${e.time}`
-          });
-        }
-      }
-    }
-
-    // Hent serie-meta, filtrér tomme, sortér
-    const names = Array.from(seriesMap.keys());
-    for (const name of names){
-      const s = seriesMap.get(name);
-      s.items.forEach(x => x.dates.sort((a,b)=>a.localeCompare(b)));
-      s.items = s.items.filter(x => x.dates.length);
-      if (name !== 'Uden for serie' && s.items.length){
-        try{
-          const meta = await fetchSeriesMeta(name);
-          if (meta){ s.intro = meta.intro || ''; s.banner = meta.banner || null; }
-        }catch{}
-      }
-      if (!s.items.length) seriesMap.delete(name);
-    }
-
-    const order = Array.from(seriesMap.keys()).sort((a,b)=>{
-      const fa = seriesMap.get(a).items.reduce((min, x)=>Math.min(min, Date.parse(x.dates[0].replace(' ','T'))), Number.POSITIVE_INFINITY);
-      const fb = seriesMap.get(b).items.reduce((min, x)=>Math.min(min, Date.parse(x.dates[0].replace(' ','T'))), Number.POSITIVE_INFINITY);
-      if (fa !== fb) return fa - fb;
-      return a.localeCompare(b);
-    });
-
-    render(seriesMap, order);
-    setStatus('Færdig. Klar til print (Cmd+P).');
+    setStatus('Henter program fra serveren...');
+    const r = await fetch('/program?'+params.toString(), { cache: 'no-store' });
+    if (!r.ok){ throw new Error('Serverfejl: '+r.status); }
+    const data = await r.json();
+    render(data);
+    setStatus('Færdig. Klar til print.');
   }catch(e){
     console.error(e);
     setStatus('Fejl: ' + e.message);
