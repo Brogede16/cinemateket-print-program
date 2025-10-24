@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="da">
+<head>
+  <meta charset="utf-8">
+  <title>Cinemateket – Printvenligt program</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { --muted:#555; --brand:#005dab; }
+    html,body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;margin:0;color:#111}
+    header{position:sticky;top:0;background:#fff;padding:12px 16px;box-shadow:0 2px 8px rgba(0,0,0,.06);z-index:10}
+    h1{margin:.2rem 0;font-size:20px}
+    .controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .controls input, .controls button{padding:6px 10px;font-size:14px}
+    .controls button{background:var(--brand);color:#fff;border:0;border-radius:6px;cursor:pointer}
+    .controls button[disabled]{opacity:.6;cursor:not-allowed}
+    .status{margin-top:6px;font-size:13px;color:#333}
+    main{padding:16px;max-width:1000px;margin:0 auto}
+    .series{background:#fff;border:1px solid #eee;border-radius:12px;padding:14px 14px 6px 14px;margin:16px 0;box-shadow:0 2px 6px rgba(0,0,0,.04)}
+    .series h2{font-size:26px;color:var(--brand);margin:6px 0 6px 0}
+    .series-banner{width:100%;max-height:300px;object-fit:cover;border-radius:8px}
+    .series-intro{color:#333;margin:8px 0 10px 0}
+    .card{display:grid;grid-template-columns:120px 1fr;gap:12px;align-items:start;padding:10px 0;border-bottom:1px solid #eee;break-inside:avoid}
+    .card:last-child{border-bottom:0}
+    .poster{width:120px;height:auto;background:#f3f3f3;border-radius:6px}
+    .card h3{margin:.2rem 0 .4rem 0;font-size:18px}
+    .meta{font-size:12px;color:#333;margin-top:4px}
+    .dates{font-weight:bold;color:var(--brand)}
+    .hint{font-size:12px;color:var(--muted)}
+    @media print{
+      header,.hint{display:none}
+      a{color:#000;text-decoration:none}
+      .series{box-shadow:none;border:0;page-break-before:always}
+      .series:first-of-type{page-break-before:auto}
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Cinemateket – Printvenligt program</h1>
+  <div class="controls">
+    <label><input type="radio" name="scope" value="all" checked> Alle kommende</label>
+    <label><input type="radio" name="scope" value="range"> Vælg interval</label>
+    <span id="rangeInputs" style="display:none">
+      Fra <input id="from" type="date">
+      Til <input id="to" type="date">
+    </span>
+    <button id="run">Generér</button>
+    <span class="hint">Data hentes live fra dfi.dk/cinemateket via en lille proxy på Render.</span>
+  </div>
+  <div id="status" class="status">Klar.</div>
+</header>
+<main id="out"></main>
+
+<script>
+// Basis-konfig
+const BASE = 'https://www.dfi.dk';
+const CALENDAR_URL = BASE + '/node/41948';
+const SERIES_INDEX_URL = BASE + '/cinemateket/biograf/filmserier';
+const FETCH = (url) => '/fetch?url=' + encodeURIComponent(url);
+
+// UI helpers
+const $ = (id) => document.getElementById(id);
+const setStatus = (t) => $('status').textContent = t;
+const abs = (href) => { try { return new URL(href, BASE).toString(); } catch { return href; } };
+const parseHTML = (html) => new DOMParser().parseFromString(html, 'text/html');
+
+// Vis eller skjul interval-felter
+document.querySelectorAll('input[name="scope"]').forEach(r => r.addEventListener('change', () => {
+  $('rangeInputs').style.display = (document.querySelector('input[name="scope"]:checked').value === 'range') ? '' : 'none';
+}));
+
+// Dato-værktøj
+function todayISO(){
+  const d = new Date();
+  const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), day = String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
+$('from').value = todayISO();
+const t = new Date(); t.setDate(t.getDate()+30);
+$('to').value = `${t.getFullYear()}-${String(t.getMonth()+1).padStart(2,'0')}-${String(t.getDate()).padStart(2,'0')}`;
+
+function isoFromLabel(label, year){
+  const months = { januar:1,februar:2,marts:3,april:4,maj:5,juni:6,juli:7,august:8,september:9,oktober:10,november:11,december:12 };
+  const m = label.toLowerCase().match(/^(mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(\d{1,2})\.\s*(\w+)/i);
+  if (!m) return null;
+  const day = parseInt(m[2],10), mon = months[m[3]];
+  if (!mon) return null;
+  const d = new Date(Date.UTC(year, mon-1, day));
+  const wk = ['søndag','mandag','tirsdag','onsdag','torsdag','fredag','lørdag'][d.getUTCDay()];
+  if (wk !== m[1]) console.warn('Ugedag stemmer ikke:', label, 'beregnet:', wk);
+  return d.toISOString().slice(0,10);
+}
+
+function withinScope(iso, scope, startISO, endISO){
+  if (scope === 'all') return iso >= todayISO();
+  return iso >= startISO && iso <= endISO;
+}
+
+// Fetch helpers
+async function fetchDoc(url){
+  const r = await fetch(FETCH(url));
+  if (!r.ok) throw new Error(`Netværksfejl ${r.status} for ${url}`);
+  const txt = await r.text();
+  return parseHTML(txt);
+}
+
+// Kalenderparser
+async function parseCalendarDays(){
+  const doc = await fetchDoc(CALENDAR_URL);
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+  const nodes=[]; let n;
+  while(n = walker.nextNode()){ const t = n.textContent.trim(); if (t) nodes.push(n); }
+  const dayRe = /^(Mandag|Tirsdag|Onsdag|Torsdag|Fredag|Lørdag|Søndag)\s+\d{1,2}\./i;
+  const timeRe = /^\d{1,2}:\d{2}$/;
+  const dayIdx = nodes.map((x,i) => dayRe.test(x.textContent.trim()) ? i : -1).filter(i=>i>=0);
+  const days=[];
+  for (let i=0;i<dayIdx.length;i++){
+    const start = dayIdx[i], end = dayIdx[i+1] ?? nodes.length;
+    const dayLabel = nodes[start].textContent.trim();
+    const chunk = nodes.slice(start, end);
+    const entries=[];
+    for (let j=0;j<chunk.length;j++){
+      const st = chunk[j].textContent.trim();
+      if (timeRe.test(st)){
+        const time = st;
+        // find titel
+        let k = j+1, title=null; while(k<chunk.length && !title){ const c = chunk[k].textContent.trim(); if (c) title=c; k++; }
+        // find link
+        const link = Array.from(doc.querySelectorAll('a')).find(a => a.textContent.trim() === title);
+        const href = link ? abs(link.getAttribute('href')) : null;
+        let series_label=null, is_event=false;
+        for (let m=j+1; m<Math.min(j+8,chunk.length); m++){
+          const t = chunk[m].textContent.trim();
+          if(/^Serier:/i.test(t)) series_label = t.split(':')[1]?.trim() || null;
+          if(/^Event$/i.test(t)) is_event = true;
+        }
+        entries.push({ time, title:title||'', href, series_label, is_event });
+      }
+    }
+    days.push({ dayLabel, entries });
+  }
+  return days;
+}
+
+// Film og events
+async function parseFilmPage(url){
+  const doc = await fetchDoc(url);
+  const title = doc.querySelector('h1,h2')?.textContent.trim() || '';
+  const ps = Array.from(doc.querySelectorAll('p'));
+  const metaTriggers = ['Medvirkende:','Instruktør:','Original titel:','Sprog:','Aldersgrænse:'];
+  let synopsis='';
+  for (let i=0;i<ps.length;i++){
+    const t = ps[i].textContent.replace(/\s+/g,' ').trim();
+    if (metaTriggers.some(m=>t.includes(m))){
+      synopsis = ps.slice(Math.max(0,i-3), i).map(x=>x.textContent.trim()).join(' ');
+      break;
+    }
+  }
+  if (!synopsis && ps[0]) synopsis = ps[0].textContent.trim();
+  const img = doc.querySelector('img');
+  const image_url = img ? abs(img.getAttribute('src')) : null;
+  const m = doc.body.innerText.match(/Film i serien\s+–\s+(.+)/);
+  const series_name = m ? m[1].trim() : null;
+  return { title, synopsis, image_url, series_name };
+}
+async function parseEventPage(url){
+  const doc = await fetchDoc(url);
+  const title = doc.querySelector('h1,h2')?.textContent.trim() || '';
+  const body = doc.querySelector('div.field--name-body, article, main');
+  const synopsis = body?.querySelector('p')?.textContent.trim() || doc.querySelector('p')?.textContent.trim() || '';
+  const img = doc.querySelector('img');
+  const image_url = img ? abs(img.getAttribute('src')) : null;
+  return { title, synopsis, image_url };
+}
+
+// Serie-intro og bannerbillede
+async function fetchSeriesMeta(series_name){
+  const idx = await fetchDoc(SERIES_INDEX_URL);
+  const a = Array.from(idx.querySelectorAll('a')).find(x => x.textContent.trim().toLowerCase() === series_name.trim().toLowerCase());
+  if (!a) return null;
+  const url = abs(a.getAttribute('href'));
+  const doc = await fetchDoc(url);
+  // intro
+  const header = Array.from(doc.querySelectorAll('h1,h2')).find(h => h.textContent.trim().toLowerCase() === series_name.trim().toLowerCase());
+  let node = header ? header.nextElementSibling : doc.querySelector('main,article');
+  const chunks=[];
+  while(node){
+    const txt = node.textContent.trim();
+    if (/Film i serien/i.test(txt) || /Køb billetter/i.test(txt)) break;
+    if (node.tagName === 'P') chunks.push(txt);
+    node = node.nextElementSibling;
+  }
+  // bannerbillede, prøv første img i hovedindholdet
+  const banner = doc.querySelector('img');
+  const banner_url = banner ? abs(banner.getAttribute('src')) : null;
+  return { series_url:url, series_intro:chunks.join('\n\n').trim(), series_banner: banner_url };
+}
+
+// Byg datasæt
+async function buildPackage(scope, startISO, endISO){
+  const Y = new Date().getFullYear(); // bruges til at udlede år for dagslabels
+  const days = await parseCalendarDays();
+  const data = { series:{}, items_unseriesed:[] };
+
+  // Saml items pr. link, ét kort per film/event
+  function upsert(bucket, key, base){
+    const slot = bucket.get(key);
+    if (slot) return slot;
+    bucket.set(key, { ...base, screenings:new Set() });
+    return bucket.get(key);
+  }
+
+  // midlertidige buckets pr. serie + udenfor
+  const seriesMap = new Map(); // name -> Map(url -> item)
+  const unseriesed = new Map(); // url -> item
+
+  for (const day of days){
+    const iso = isoFromLabel(day.dayLabel, Y);
+    if (!iso) continue;
+    if (!withinScope(iso, scope, startISO, endISO)) continue;
+
+    for (const e of day.entries){
+      if (!e.href) continue;
+      let details={}, series_name = e.series_label || null, type='film';
+      if (e.href.includes('/cinemateket/biograf/alle-film/film/')){
+        details = await parseFilmPage(e.href);
+        series_name = details.series_name || series_name;
+        type = 'film';
+      } else if (e.href.includes('/cinemateket/biograf/') && e.href.includes('/events/')){
+        details = await parseEventPage(e.href);
+        type = 'event';
+      } else {
+        continue;
+      }
+      const dt = `${iso} ${e.time||''}`.trim();
+
+      if (series_name){
+        if (!seriesMap.has(series_name)) seriesMap.set(series_name, new Map());
+        const slot = upsert(seriesMap.get(series_name), e.href, {
+          type, url:e.href, title: details.title || e.title, image_url: details.image_url || null, synopsis: details.synopsis || ''
+        });
+        slot.screenings.add(dt);
+      } else {
+        const slot = upsert(unseriesed, e.href, {
+          type, url:e.href, title: details.title || e.title, image_url: details.image_url || null, synopsis: details.synopsis || ''
+        });
+        slot.screenings.add(dt);
+      }
+    }
+  }
+
+  // Flyt til endelig struktur, filtrér tomme, hent serie-meta og sortér
+  async function finalizeSeries(){
+    const out = {};
+    for (const [name, m] of seriesMap.entries()){
+      // screenings til array, sortér og scope-filter
+      const items = Array.from(m.values()).map(it => {
+        const arr = Array.from(it.screenings).filter(Boolean).sort();
+        return { ...it, screenings: arr };
+      });
+
+      // drop items uden screenings i scope
+      const filtered = items.filter(it => it.screenings.some(s => withinScope(s.slice(0,10), scope, startISO, endISO)));
+      if (filtered.length === 0) continue;
+
+      // hent serieintro og banner
+      let series_intro = "", series_url = null, series_banner = null;
+      try {
+        const meta = await fetchSeriesMeta(name);
+        if (meta){ series_intro = meta.series_intro || ""; series_url = meta.series_url || null; series_banner = meta.series_banner || null; }
+      } catch {}
+
+      out[name] = { series_intro, series_url, series_banner, items: filtered };
+    }
+    return out;
+  }
+
+  data.series = await finalizeSeries();
+
+  // uden for serie
+  data.items_unseriesed = Array.from(unseriesed.values()).map(it => {
+    const arr = Array.from(it.screenings).filter(Boolean).sort();
+    return { ...it, screenings: arr };
+  }).filter(it => it.screenings.some(s => withinScope(s.slice(0,10), scope, startISO, endISO)));
+
+  // sortér serier efter tidligste kommende visning
+  function firstEpoch(items){
+    const a = items.map(it => it.screenings[0]).filter(Boolean);
+    return a.length ? Date.parse(a[0].replace(' ','T')) : Number.POSITIVE_INFINITY;
+  }
+  data._sorted_names = Object.keys(data.series).sort((a,b) => {
+    const ea = firstEpoch(data.series[a].items);
+    const eb = firstEpoch(data.series[b].items);
+    if (ea !== eb) return ea - eb;
+    return a.localeCompare(b);
+  });
+  return data;
+}
+
+// Rendering
+function cardHTML(it){
+  const dates = it.screenings.map(s => {
+    // vis "dd.mm kl. HH:MM"
+    const d = s.slice(0,10).split("-"); const t = s.slice(11,16);
+    return `${d[2]}.${d[1]} kl. ${t}`;
+  }).join(", ");
+  return `<div class="card">
+    ${it.image_url ? `<img class="poster" src="${it.image_url}" alt="">` : `<div></div>`}
+    <div>
+      <h3>${it.title}</h3>
+      ${it.synopsis ? `<div>${it.synopsis}</div>` : ``}
+      ${it.screenings?.length ? `<div class="meta"><span class="dates">Datoer:</span> ${dates}</div>` : ``}
+      ${it.url ? `<div class="meta"><a href="${it.url}" target="_blank" rel="noopener">Detaljer</a></div>` : ``}
+    </div>
+  </div>`;
+}
+
+function render(pkg){
+  const out = $('out'); const parts=[];
+  if (pkg.items_unseriesed.length){
+    parts.push(`<section class="series">
+      <h2>Uden for serie</h2>
+      ${pkg.items_unseriesed.map(cardHTML).join("")}
+    </section>`);
+  }
+  for (const name of pkg._sorted_names){
+    const bucket = pkg.series[name];
+    parts.push(`<section class="series">
+      <h2>${name}</h2>
+      ${bucket.series_banner ? `<img class="series-banner" src="${bucket.series_banner}" alt="">` : ``}
+      ${bucket.series_intro ? `<div class="series-intro">${bucket.series_intro}</div>` : ``}
+      ${bucket.items.map(cardHTML).join("")}
+    </section>`);
+  }
+  out.innerHTML = parts.join("\n");
+}
+
+// Kørsel
+$('run').addEventListener('click', async () => {
+  try {
+    $('run').disabled = true;
+    const scope = document.querySelector('input[name="scope"]:checked').value;
+    const startISO = $('from').value;
+    const endISO = $('to').value;
+    if (scope === 'range' && (!startISO || !endISO || startISO > endISO)) {
+      setStatus('Ugyldigt interval. "Fra" skal være før eller lig "Til".'); $('run').disabled = false; return;
+    }
+    setStatus('Henter kalender og bygger program...');
+    const pkg = await buildPackage(scope, startISO, endISO);
+    render(pkg);
+    setStatus('Færdig. Klar til print med Cmd+P.');
+  } catch (e) {
+    console.error(e);
+    setStatus('Fejl: ' + e.message);
+  } finally {
+    $('run').disabled = false;
+  }
+});
+</script>
+</body>
+</html>
