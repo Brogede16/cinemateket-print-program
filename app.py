@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request, Response, send_from_directory
 
 # ---------------- Konfiguration ----------------
 BASE = "https://www.dfi.dk"
-CALENDAR_PRIMARY = f"{BASE}/cinemateket/biograf/kalender"
+CALENDAR_PRIMARY = f"{BASE}/cinemateket/biograf/events"
 CALENDAR_FALLBACK = CALENDAR_PRIMARY  # node/41948 findes ikke længere
 SERIES_INDEX_URL = f"{BASE}/cinemateket/biograf/filmserier"
 
