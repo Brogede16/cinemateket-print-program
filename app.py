@@ -1,7 +1,9 @@
+# app.py
 import os
 import re
 import sys
 import time
+import json
 from datetime import datetime, date
 from urllib.parse import urlparse, urljoin
 
@@ -11,10 +13,9 @@ from flask import Flask, jsonify, request, Response, send_from_directory
 
 # ---------------- Konfiguration ----------------
 BASE = "https://www.dfi.dk"
-# Brug Alle film i stedet for kalender, da kalender returnerer 404
-CALENDAR_PRIMARY = f"{BASE}/cinemateket/biograf/alle-film"
-CALENDAR_FALLBACK = CALENDAR_PRIMARY
+CALENDAR_PRIMARY = f"{BASE}/cinemateket/biograf/alle-film"   # "Alle film" fungerer som primær kilde
 SERIES_INDEX_URL = f"{BASE}/cinemateket/biograf/filmserier"
+EVENTS_INDEX_URL = f"{BASE}/cinemateket/biograf/events"
 
 ALLOWED_HOSTS = {"www.dfi.dk", "dfi.dk"}
 TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "25"))
@@ -37,21 +38,11 @@ MONTHS = {
     "juli": 7, "august": 8, "september": 9, "oktober": 10, "november": 11, "december": 12
 }
 MONTHS_DA = {
-    "jan":1,"januar":1,
-    "feb":2,"februar":2,
-    "mar":3,"marts":3,
-    "apr":4,"april":4,
-    "maj":5,
-    "jun":6,"juni":6,
-    "jul":7,"juli":7,
-    "aug":8,"august":8,
-    "sep":9,"september":9,
-    "okt":10,"oktober":10,
-    "nov":11,"november":11,
-    "dec":12,"december":12
+    "jan":1,"januar":1,"feb":2,"februar":2,"mar":3,"marts":3,"apr":4,"april":4,"maj":5,
+    "jun":6,"juni":6,"jul":7,"juli":7,"aug":8,"august":8,"sep":9,"september":9,"okt":10,"oktober":10,
+    "nov":11,"november":11,"dec":12,"december":12
 }
 DAY_RE = re.compile(r"^(Mandag|Tirsdag|Onsdag|Torsdag|Fredag|Lørdag|Søndag)\s+(\d{1,2})\.\s*(\w+)", re.I)
-TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
 
 def log(*args):
     print("[APP]", *args, file=sys.stdout, flush=True)
@@ -110,14 +101,8 @@ def clean_synopsis(txt: str) -> str:
     if not txt:
         return ""
     blacklist_exact = [
-        "Gør dit lærred lidt bredere",
-        "Filmtaget",
-        "Se alle",
-        "Læs mere",
-        "Køb billetter",
-        "Relaterede programmer",
-        "Cinemateket",
-        "Dansk film under åben himmel",
+        "Gør dit lærred lidt bredere", "Filmtaget", "Se alle", "Læs mere",
+        "Køb billetter", "Relaterede programmer", "Cinemateket", "Dansk film under åben himmel",
     ]
     lines = [ln.strip() for ln in re.split(r"\n+", txt)]
     lines = [
@@ -147,7 +132,6 @@ def extract_title(doc: BeautifulSoup, url: str) -> str:
         pass
     for s in doc.select('script[type="application/ld+json"]'):
         try:
-            import json
             obj = json.loads(s.text or "")
             if isinstance(obj, list):
                 for it in obj:
@@ -202,21 +186,98 @@ def extract_image(doc: BeautifulSoup) -> str | None:
         pass
     return None
 
-# ---------------- Kerneskridt ----------------
+# ---------- De-dup & normalisering ----------
+TITLE_TRIM = re.compile(r"\s+")
+PAREN_TRIM = re.compile(r"\s*\([^)]*\)\s*$")
 
+def canonical_title(raw: str) -> str:
+    if not raw:
+        return ""
+    t = raw.strip()
+    t = PAREN_TRIM.sub("", t)        # fjern trailing parenteser som "(Q&A)"
+    t = TITLE_TRIM.sub(" ", t)
+    return t.lower()
+
+def merge_dates(existing: list[str], incoming: list[str]) -> list[str]:
+    s = set(existing or [])
+    for dt in incoming or []:
+        if dt:
+            s.add(dt)
+    out = sorted(s)
+    return out
+
+def weekday_label_from_iso(iso_date: str) -> str:
+    WEEKDAYS = ["Mandag","Tirsdag","Onsdag","Torsdag","Fredag","Lørdag","Søndag"]
+    MONTHS_FULL = ['januar','februar','marts','april','maj','juni','juli','august','september','oktober','november','december']
+    y, m, d = map(int, iso_date.split("-"))
+    wd = WEEKDAYS[date(y, m, d).weekday()]
+    return f"{wd} {d}. {MONTHS_FULL[m-1]}"
+
+# ---------------- Hjælp: list-opsamling ----------------
+def collect_list_items(start_url: str, within_path_prefix: str) -> set[str]:
+    """
+    Generisk opsamler fra lister med pagination.
+    Finder alle film-/event-links under et path-prefix, inkl. ?page=...
+    """
+    found: set[str] = set()
+    visited: set[str] = set()
+    queue: list[str] = [start_url]
+    while queue:
+        url = queue.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        doc = get_soup(url)
+        for a in doc.select('a[href]'):
+            href = abs_url(a.get("href", ""))
+            if not allowed(href):
+                continue
+            if "/cinemateket/biograf/alle-film/film/" in href or "/cinemateket/biograf/events/event/" in href:
+                found.add(href)
+        for p in doc.select('a[href*="?page="]'):
+            ph = abs_url(p.get("href", ""))
+            if ph.startswith(within_path_prefix) and ph not in visited:
+                queue.append(ph)
+        time.sleep(SLEEP_BETWEEN)
+    return found
+
+# ---------------- Serier ----------------
 def build_series_registry() -> tuple[dict, dict]:
     """
     Returnerer:
-      - by_href: dict {item_href -> serienavn}
-      - meta: dict {serienavn -> {"intro": ..., "banner": ...}}
-    Strategi:
-      1) Høst serier fra serie-indekssiden.
-      2) Fallback: gå via Alle film og læs serien via breadcrumb på hver itemside.
+      - by_href: {item_href -> serienavn}
+      - meta:    {serienavn -> {"intro": ..., "banner": ...}}
+    Lag:
+      1) Serie-indeks: alle item-links pr. serie, inkl. foldede sektioner og ?page=
+      2) Fallback A: brede lister “Alle film” og “Events”
+      3) Fallback B: Breadcrumb på item-sider
     """
     by_href: dict[str, str] = {}
     meta: dict[str, dict] = {}
 
-    # Forsøg 1: serie-indeks
+    def collect_series_items(series_url: str) -> set[str]:
+        found: set[str] = set()
+        visited: set[str] = set()
+        queue: list[str] = [series_url]
+        root = series_url.split("?")[0]
+        while queue:
+            url = queue.pop(0)
+            if url in visited:
+                continue
+            visited.add(url)
+            sdoc = get_soup(url)
+            for it in sdoc.select('a[href*="/cinemateket/biograf/alle-film/film/"], a[href*="/cinemateket/biograf/events/event/"]'):
+                ih = abs_url(it.get("href", ""))
+                if allowed(ih):
+                    found.add(ih)
+            for p in sdoc.select('a[href*="?page="]'):
+                ph = abs_url(p.get("href", ""))
+                if ph.startswith(root) and ph not in visited:
+                    queue.append(ph)
+            time.sleep(SLEEP_BETWEEN)
+        return found
+
+    # Serieindeks
     idx = get_soup(SERIES_INDEX_URL)
     anchors = idx.select('a[href*="/cinemateket/biograf/filmserier/serie/"]') or []
     seen_series_pages = set()
@@ -233,33 +294,31 @@ def build_series_registry() -> tuple[dict, dict]:
             intro = clean_synopsis("\n\n".join(ps[:4])) if ps else ""
             banner = extract_image(sdoc)
             meta[sname] = {"intro": intro, "banner": banner}
-            item_anchors = sdoc.select(
-                'a[href*="/cinemateket/biograf/alle-film/film/"], a[href*="/cinemateket/biograf/events/event/"]'
-            ) or []
-            for it in item_anchors:
-                ih = abs_url(it.get("href", ""))
-                if allowed(ih):
-                    by_href[ih] = sname
-        except Exception:
-            pass
+            for ih in collect_series_items(s_url):
+                by_href[ih] = sname
+        except Exception as ex:
+            log("series harvest error:", s_url, ex)
         time.sleep(SLEEP_BETWEEN)
 
-    if by_href:
-        log(f"Series registry (index): {len(by_href)} items")
-        return by_href, meta
+    # Fallback-lister: Alle film + Events
+    all_items = set()
+    try:
+        all_items |= collect_list_items(CALENDAR_PRIMARY, CALENDAR_PRIMARY.split("?")[0])
+    except Exception:
+        pass
+    try:
+        all_items |= collect_list_items(EVENTS_INDEX_URL, EVENTS_INDEX_URL.split("?")[0])
+    except Exception:
+        pass
 
-    # Forsøg 2: via Alle film
-    al = get_soup(CALENDAR_PRIMARY)
-    item_links = al.select(
-        'a[href*="/cinemateket/biograf/alle-film/film/"], a[href*="/cinemateket/biograf/events/event/"]'
-    ) or []
+    # Breadcrumb fallback
     seen_items = set()
-
-    for a in item_links:
-        ih = abs_url(a.get("href", ""))
+    for ih in sorted(all_items):
         if not allowed(ih) or ih in seen_items:
             continue
         seen_items.add(ih)
+        if ih in by_href:
+            continue
         try:
             d = get_soup(ih)
             s_anchor = d.select_one('a[href*="/cinemateket/biograf/filmserier/serie/"]')
@@ -279,14 +338,13 @@ def build_series_registry() -> tuple[dict, dict]:
             pass
         time.sleep(SLEEP_BETWEEN)
 
-    log(f"Series registry (fallback): {len(by_href)} items")
+    log(f"Series registry total: {len(by_href)} items, {len(meta)} series")
     return by_href, meta
 
+# ---------------- Kalender & detaljer ----------------
 def parse_calendar() -> list[dict]:
     """
-    Bygger pseudo-dage ud fra Alle film-listen.
-    Vi læser dato-strenge fra kortene, fx "25. okt, 28. okt".
-    Returnerer [{label, entries:[{time,title,href}]}] hvor time er "00:00" som placeholder.
+    Pseudo-dage fra “Alle film”. Finder dato-chunks nær linket.
     """
     doc = get_soup(CALENDAR_PRIMARY)
     cards = doc.select(
@@ -333,18 +391,17 @@ def parse_calendar() -> list[dict]:
             entry = {"time": "00:00", "title": title, "href": href}
             day_map.setdefault(iso, []).append(entry)
 
-    WEEKDAYS = ["Mandag","Tirsdag","Onsdag","Torsdag","Fredag","Lørdag","Søndag"]
     out = []
     for iso, entries in sorted(day_map.items()):
-        y, m, d = map(int, iso.split("-"))
-        wd = WEEKDAYS[date(y, m, d).weekday()]
-        label = f"{wd} {d}. {['januar','februar','marts','april','maj','juni','juli','august','september','oktober','november','december'][m-1]}"
+        label = weekday_label_from_iso(iso)  # servervalideret ugedag
         out.append({"label": label, "entries": entries})
     return out
 
 def fetch_item_details(url: str) -> dict:
     """
-    Returnerer {title, synopsis, image, times}
+    Returnerer {title, synopsis, image, times, datetimes}
+    - times: rene klokkeslæt fundet på siden, fx ["19:15", ...]
+    - datetimes: ISO "YYYY-MM-DD HH:MM" parset fra tekst som "25. nov kl. 19:15"
     """
     doc = get_soup(url)
     title = extract_title(doc, url)
@@ -353,29 +410,39 @@ def fetch_item_details(url: str) -> dict:
         ps = [p.get_text(" ", strip=True) for p in (wrap.select("p") if wrap else [])]
     except Exception:
         ps = []
-    raw = "\n\n".join(ps[:4]) if ps else ""
-    if not raw:
-        try:
-            ps_all = [p.get_text(" ", strip=True) for p in doc.select("p")]
-            raw = "\n\n".join(ps_all[:4])
-        except Exception:
-            raw = ""
+    raw = "\n\n".join(ps[:6]) if ps else ""
     synopsis = clean_synopsis(raw)
     image = extract_image(doc)
 
-    times = []
-    try:
-        for tnode in doc.find_all(string=re.compile(r"\b\d{1,2}:\d{2}\b")):
-            st = tnode.strip()
-            if re.match(r"^\d{1,2}:\d{2}$", st):
-                times.append(st)
-    except Exception:
-        pass
+    text_all = doc.get_text(" ", strip=True)
 
-    return {"title": title, "synopsis": synopsis, "image": image, "times": sorted(set(times))}
+    # 1) klokkeslæt
+    times = sorted(set(re.findall(r"\b(\d{1,2}:\d{2})\b", text_all)))
 
-# ---------------- HTTP routes ----------------
+    # 2) dato+tid
+    datetimes = []
+    current_year = datetime.now().year
+    dt_pattern = re.compile(
+        r"(\d{1,2})\.\s*([A-Za-zæøåÆØÅ]+)(?:\s*(?:kl\.?|KL\.?)\s*)?(\d{1,2}:\d{2})",
+        re.I
+    )
+    for g in dt_pattern.finditer(text_all):
+        day = int(g.group(1))
+        mon_name = g.group(2).lower()
+        tm = g.group(3)
+        mon = MONTHS_DA.get(mon_name)
+        if not mon:
+            continue
+        try:
+            iso = date(current_year, mon, day).isoformat()
+            datetimes.append(f"{iso} {tm}")
+        except ValueError:
+            continue
 
+    datetimes = sorted(set(datetimes))
+    return {"title": title, "synopsis": synopsis, "image": image, "times": times, "datetimes": datetimes}
+
+# ---------------- Routes ----------------
 @app.after_request
 def add_headers(resp: Response):
     resp.headers.setdefault("Access-Control-Allow-Origin", "*")
@@ -394,19 +461,27 @@ def index():
 @app.get("/program")
 def program():
     """
-    JSON-output:
-      generated_at, scope, series:[{name,intro,banner,items:[{url,title,image,synopsis,dates[]}]}]
+    JSON:
+      {
+        generated_at, scope,
+        series: [
+          {name,intro,banner,items:[
+            {url,title,image,synopsis,dates:[ISO "YYYY-MM-DD HH:MM"], canon}
+          ]}
+        ]
+      }
     """
     try:
         mode = request.args.get("mode", "all")
         d_from = request.args.get("from", today_iso())
-        d_to = request.args.get("to", None)
+        d_to = request.args.get("to")
 
         by_href, meta = build_series_registry()
         days = parse_calendar()
         current_year = datetime.now().year
 
         series_map: dict[str, dict] = {}
+
         for d in days:
             iso = iso_from_label(d.get("label", ""), current_year)
             if not iso:
@@ -434,34 +509,125 @@ def program():
                         "items": {}
                     }
 
-                bucket = series_map[sname]["items"]
-                if href not in bucket:
-                    try:
-                        det = fetch_item_details(href)
-                    except Exception as ex:
-                        log("fetch_item_details failed:", href, ex)
-                        det = {"title": e.get("title") or "Titel", "synopsis": "", "image": None, "times": []}
-                    bucket[href] = {
+                # Hent detaljer og de-dup på titel inden for serien
+                try:
+                    det = fetch_item_details(href)
+                except Exception as ex:
+                    log("fetch_item_details failed:", href, ex)
+                    det = {"title": e.get("title") or "Titel", "synopsis": "", "image": None, "times": [], "datetimes": []}
+
+                title_eff = det.get("title") or (e.get("title") or "Titel")
+                canon = canonical_title(title_eff)
+
+                # eksisterende item med samme kanoniske titel?
+                existing_key = None
+                for k, v in series_map[sname]["items"].items():
+                    if v.get("canon") == canon:
+                        existing_key = k
+                        break
+
+                # konstruer nye datoer for denne dag
+                new_dates = []
+                if e.get("time") == "00:00":
+                    if det.get("times"):
+                        for tm in det["times"]:
+                            new_dates.append(f"{iso} {tm}")
+                    else:
+                        for dt_full in det.get("datetimes", []):
+                            if dt_full.startswith(iso):
+                                new_dates.append(dt_full)
+                else:
+                    new_dates.append(f"{iso} {e.get('time')}")
+
+                if existing_key:
+                    item = series_map[sname]["items"][existing_key]
+                    if not item.get("image") and det.get("image"):
+                        item["image"] = det["image"]
+                    if not item.get("synopsis") and det.get("synopsis"):
+                        item["synopsis"] = det["synopsis"]
+                    item["dates"] = merge_dates(item["dates"], new_dates)
+                else:
+                    series_map[sname]["items"][href] = {
+                        "canon": canon,
                         "url": href,
-                        "title": det.get("title") or (e.get("title") or "Titel"),
+                        "title": title_eff,
                         "image": det.get("image"),
                         "synopsis": det.get("synopsis", ""),
                         "times": det.get("times", []),
-                        "dates": []
+                        "dates": sorted(set(new_dates))
                     }
-                    time.sleep(SLEEP_BETWEEN)
 
-                # erstat placeholder 00:00 med faktiske tider hvis de findes
-                if bucket[href]["times"] and e.get("time") == "00:00":
-                    for tm in bucket[href]["times"]:
-                        dt_full = f"{iso} {tm}"
-                        if dt_full not in bucket[href]["dates"]:
-                            bucket[href]["dates"].append(dt_full)
+                time.sleep(SLEEP_BETWEEN)
+
+        # Fallback: gennemgå alle by_href for at få titler der ikke var i "Alle film"-dagene
+        for href, sname in by_href.items():
+            # findes der allerede et item med samme canonical-title?
+            try:
+                det = fetch_item_details(href)
+            except Exception as ex:
+                log("fallback fetch_item_details failed:", href, ex)
+                continue
+
+            title_eff = det.get("title") or "Titel"
+            canon = canonical_title(title_eff)
+
+            existed = False
+            if sname in series_map:
+                for v in series_map[sname]["items"].values():
+                    if v.get("canon") == canon:
+                        existed = True
+                        # filtrér filmsidens datotider ind i scope
+                        valid_dt = []
+                        for dt_full in det.get("datetimes", []):
+                            iso_dt = dt_full[:10]
+                            if mode == "all":
+                                if iso_dt >= today_iso():
+                                    valid_dt.append(dt_full)
+                            else:
+                                if d_from <= iso_dt <= d_to:
+                                    valid_dt.append(dt_full)
+                        v["dates"] = merge_dates(v["dates"], valid_dt)
+                        if not v.get("image") and det.get("image"):
+                            v["image"] = det["image"]
+                        if not v.get("synopsis") and det.get("synopsis"):
+                            v["synopsis"] = det["synopsis"]
+                        break
+
+            if existed:
+                continue
+
+            # hvis serien slet ikke er oprettet endnu
+            if sname not in series_map:
+                series_map[sname] = {
+                    "intro": meta.get(sname, {}).get("intro", ""),
+                    "banner": meta.get(sname, {}).get("banner", None),
+                    "items": {}
+                }
+
+            valid_dt = []
+            for dt_full in det.get("datetimes", []):
+                iso_dt = dt_full[:10]
+                if mode == "all":
+                    if iso_dt >= today_iso():
+                        valid_dt.append(dt_full)
                 else:
-                    dt = f"{iso} {e.get('time')}"
-                    if dt not in bucket[href]["dates"]:
-                        bucket[href]["dates"].append(dt)
+                    if d_from <= iso_dt <= d_to:
+                        valid_dt.append(dt_full)
 
+            if not valid_dt:
+                continue
+
+            series_map[sname]["items"][href] = {
+                "canon": canon,
+                "url": href,
+                "title": title_eff,
+                "image": det.get("image"),
+                "synopsis": det.get("synopsis", ""),
+                "times": det.get("times", []),
+                "dates": sorted(set(valid_dt))
+            }
+
+        # Byg output
         out_series = []
         for name, data in series_map.items():
             items = list(data["items"].values())
@@ -484,11 +650,12 @@ def program():
 
         out_series.sort(key=lambda s: (first_dt(s), s["name"]))
 
-        return jsonify({
+        payload = {
             "generated_at": datetime.utcnow().isoformat() + "Z",
             "scope": {"mode": mode, "from": d_from, "to": d_to},
             "series": out_series
-        }), 200
+        }
+        return jsonify(payload), 200
 
     except Exception as e:
         log("PROGRAM ROUTE ERROR:", repr(e))
